@@ -102,7 +102,8 @@ Run `dsh web` and find the card:
 1. **Click an engine row** and paste keys (one per line); "Get an API key ↗" links to the signup page.
 2. **Drag the `⋮⋮` handle** to set the call order: higher rows go first, failing through in order.
 3. The **"Enable web_fetch"** switch at the top: when off, `web_fetch` calls return a clear error.
-4. Click **Save**; it applies from the next search, no restart.
+4. The **Advanced → "Search engines"** list (under the presets, collapsed by default; the conversation-header popover has it in the same seat) switches each configured engine on or off with a toggle. Off means the whole engine is off: it leaves both the search chain and `web_fetch` fetching, its keys are kept, and switching it back on restores it. With every engine off, search is unavailable and the list says so in red.
+5. Click **Save**; it applies from the next search, no restart.
 
 Configure at least one engine, or search fails with `No web search providers configured.`
 
@@ -118,6 +119,7 @@ The "Advanced" section at the bottom is collapsed by default and works untouched
 
 | Setting               | Field                 | Description                                                                                                                                   |
 | --------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Disabled engines      | `disabledEngines`     | Engine names, empty by default. A disabled engine leaves both the search and the fetch chain; its keys are kept |
 | Search strategy       | `searchStrategy`      | `fallback` (default) one at a time, least quota; `race` queries the first N at once and takes the fastest; `merge` queries the first N and fuses results — best coverage, N× quota |
 | Engines at once       | `parallelEngines`     | 2–4, default 2; `race` / `merge` only                                                                                                         |
 | Region / language     | `region` / `language` | Default `auto`. Brave, SerpApi, Serping API, TinyFish and AnySearch take both; Tavily and Exa region only; SearXNG language only; the rest neither |

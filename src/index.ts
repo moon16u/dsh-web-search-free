@@ -50,6 +50,14 @@ export interface Config {
   /** Who serves `web_fetch`; see `FETCH_SOURCES`. Only consulted while `enableFetch` is on. */
   fetchSource?: FetchSource
   providerOrder: string[]
+  /**
+   * Engines switched off from the card's engine list. Unlike reordering, this
+   * keeps the key: a disabled engine leaves BOTH the search and the fetch
+   * chain (one switch, one meaning), and comes back the moment it is re-enabled.
+   * A deny-list rather than an allow-list so every engine added later defaults
+   * to on, exactly like a config that predates this field.
+   */
+  disabledEngines?: string[]
   /** How the search chain is walked; see `SEARCH_STRATEGIES`. */
   searchStrategy?: SearchStrategy
   /** Engines queried at once under `race` / `merge`. */
@@ -139,6 +147,8 @@ const configFields = () => ({
   providerOrder: Schema.array(Schema.union(['jina', 'exa', 'tavily', 'firecrawl', 'brave', 'anysearch', 'tinyfish', 'serpapi', 'serpingapi', 'searxng', 'baidu', 'volcengine']))
     .default(['tinyfish', 'searxng', 'anysearch', 'baidu', 'tavily', 'brave', 'exa', 'firecrawl', 'volcengine', 'serpapi', 'jina', 'serpingapi'])
     .description('定义 Provider 的调用顺序。排在前面的服务会优先执行，如果请求失败（或额度用尽），会自动按照该顺序 fallback 到下一个可用服务。'),
+  disabledEngines: Schema.array(Schema.string()).default([])
+    .description('已停用的引擎。停用后该引擎同时退出搜索与抓取链路，但 Key 保留，重新启用即恢复（卡片里的引擎列表开关控制这项）。'),
   searchStrategy: Schema.union([...SEARCH_STRATEGIES]).default('fallback')
     .description('搜索策略：fallback 逐个尝试（最省额度）；race 同时调用前 N 个引擎、取最快的；merge 同时调用前 N 个引擎并合并去重（召回最好，消耗 N 倍额度）。'),
   parallelEngines: Schema.natural().min(2).max(4).default(2)
@@ -493,9 +503,22 @@ export function apply(ctx: Context, config: RawConfig) {
     })
   })
 
-  const getActiveProviders = (capability?: 'search' | 'fetch') => {
+  /** One configured engine: its keys, and whether the card switched it off. */
+  type ProviderEntry = { provider: MyProvider; keys: string[]; disabled: boolean }
+
+  /**
+   * Every CONFIGURED engine, in call order.
+   *
+   * `disabled` is carried on the entry instead of being filtered away here,
+   * because the consumers disagree about it: the two CALL CHAINS drop disabled
+   * engines, while key tests and the usage table must keep them — a disabled
+   * engine still holds the user's keys, and "is this key still good?" / "did my
+   * calls disappear?" are exactly what the user asks after switching one off.
+   */
+  const getActiveProviders = (capability?: 'search' | 'fetch'): ProviderEntry[] => {
     const current = resolved()
-    const activeProviders: { provider: MyProvider; keys: string[] }[] = []
+    const activeProviders: ProviderEntry[] = []
+    const disabled = new Set(current.disabledEngines ?? [])
 
     const orderedNames = Array.from(new Set([
       ...(current.providerOrder || []),
@@ -517,7 +540,7 @@ export function apply(ctx: Context, config: RawConfig) {
         // A key field may hold several keys, one per line. Empty lines and
         // surrounding whitespace are stripped; rotation tries them in order.
         const keys = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-        if (keys.length > 0) activeProviders.push({ provider, keys })
+        if (keys.length > 0) activeProviders.push({ provider, keys, disabled: disabled.has(name) })
       }
     }
     return activeProviders
@@ -532,13 +555,15 @@ export function apply(ctx: Context, config: RawConfig) {
   /**
    * Every configured (engine, key) pair for `kind`, in call order, with keys
    * benched by {@link cooldownFor} moved to the back rather than out — so a
-   * fully benched chain still gets tried.
+   * fully benched chain still gets tried. Disabled engines are dropped here and
+   * ONLY here: this is the one place both call chains are built from.
    */
   function orderedAttempts(kind: 'search' | 'fetch'): Attempt[] {
     const now = Date.now()
     const ready: Attempt[] = []
     const benched: Attempt[] = []
-    for (const { provider, keys } of getActiveProviders(kind)) {
+    for (const { provider, keys, disabled } of getActiveProviders(kind)) {
+      if (disabled) continue
       for (const key of keys) {
         const until = benchedUntil.get(`${provider.name}:${key}`) ?? 0
         ;(until > now ? benched : ready).push({ provider, key })
@@ -554,7 +579,11 @@ export function apply(ctx: Context, config: RawConfig) {
    * the empty key like any other key.
    */
   function keylessFetchAttempt(current: Config): Attempt[] {
-    return current.keylessJinaFetch === false ? [] : [{ provider: availableProviders.jina, key: '' }]
+    if (current.keylessJinaFetch === false) return []
+    // Switching Jina off means Jina, keyed or not: the keyless reader is the
+    // same engine and the same third party, so it leaves with it.
+    if ((current.disabledEngines ?? []).includes('jina')) return []
+    return [{ provider: availableProviders.jina, key: '' }]
   }
 
   /**
@@ -702,7 +731,11 @@ export function apply(ctx: Context, config: RawConfig) {
   // honored live — no watch/re-sync wiring is needed.
   ctx.effect(() => ctx.web?.registerSearchProvider({
     id: 'web-search-free',
-    available: () => getActiveProviders('search').length > 0,
+    // Disabled engines do not count: with every configured engine switched off
+    // the chain really is empty, and the seam's structured "not configured"
+    // error is the honest answer rather than a search that fails after the
+    // walk finds nothing.
+    available: () => getActiveProviders('search').some((a) => !a.disabled),
     async search(request: any, signal: any) {
       const current = resolved()
       const attempts = orderedAttempts('search')
@@ -719,9 +752,10 @@ export function apply(ctx: Context, config: RawConfig) {
       // Everything that shapes the answer is in the key, so changing a
       // setting never serves a result produced under the old one. Engines go
       // in by configured order, not by `attempts`, whose order shifts as keys
-      // are benched.
+      // are benched; disabled engines are in the key too, so switching one off
+      // can never be answered from a cache entry built while it was on.
       const cacheKey = JSON.stringify([
-        request.query, getActiveProviders('search').map((a) => a.provider.name),
+        request.query, getActiveProviders('search').map((a) => `${a.provider.name}${a.disabled ? '-' : '+'}`),
         strategy, width, options, preferred, snippetLength,
       ])
       const cached = searchCache.get(cacheKey)
@@ -782,7 +816,7 @@ export function apply(ctx: Context, config: RawConfig) {
       const current = resolved()
       if (current.enableFetch === false) return false
       if (current.fetchSource === 'dsh') return dshFetchProvider() !== undefined
-      return getActiveProviders('fetch').length > 0 ||
+      return getActiveProviders('fetch').some((a) => !a.disabled) ||
         keylessFetchAttempt(current).length > 0 ||
         dshFetchProvider() !== undefined
     },
@@ -842,12 +876,17 @@ export function apply(ctx: Context, config: RawConfig) {
    * The card's view of usage: one row per configured (engine, key), keys
    * masked, plus the keyless fetch fallback once it has been used. Engines in
    * configured order, so the table reads like the call order above it.
+   *
+   * Disabled engines KEEP their rows (flagged `disabled`): switching an engine
+   * off is not a statement that its past calls never happened, and hiding the
+   * row would read as "the plugin forgot my key".
    */
   function statsSnapshot() {
     const now = Date.now()
+    const current = resolved()
     const rows: unknown[] = []
     const seen = new Set<string>()
-    const row = (provider: MyProvider, key: string) => {
+    const row = (provider: MyProvider, key: string, disabled = false) => {
       const id = `${provider.name}:${key}`
       if (seen.has(id)) return
       seen.add(id)
@@ -855,12 +894,17 @@ export function apply(ctx: Context, config: RawConfig) {
       rows.push({
         engine: provider.name,
         key: key ? maskKey(key) : null,
+        disabled,
         ...usage.tallies(provider.name, key),
         benchedForMs: until > now ? until - now : 0,
       })
     }
-    for (const { provider, keys } of getActiveProviders('search')) for (const key of keys) row(provider, key)
-    if (usage.has('jina', '')) row(availableProviders.jina, '')
+    for (const { provider, keys, disabled } of getActiveProviders('search')) for (const key of keys) row(provider, key, disabled)
+    // The keyless reader is Jina with an empty key, so it is switched off by
+    // whatever switches Jina off — `keylessFetchAttempt` already refuses to
+    // build it then, and this row has to agree or the table claims a call
+    // channel the fetch chain no longer has.
+    if (usage.has('jina', '')) row(availableProviders.jina, '', current.disabledEngines?.includes('jina') ?? false)
     return { since: usage.since, cacheHits: usage.cacheHits, rows, version: PLUGIN_VERSION }
   }
 

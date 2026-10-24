@@ -202,6 +202,8 @@ type StatsRow = {
   search: Tally;
   fetch: Tally;
   benchedForMs: number;
+  /** The engine is switched off; its rows stay so past calls remain visible. */
+  disabled?: boolean;
 };
 type Stats = {
   since: number;
@@ -368,7 +370,15 @@ const zh = {
   "legacy.copy": "复制指令",
   "legacy.copied": "已复制",
   intro:
-    "填了 Key 的引擎进入「调用顺序」：排在前面的优先调用，失败则 fallback 到下一个，拖 ⋮⋮ 可改顺序。每个引擎可填多个 Key（每行一个），同一引擎内也按顺序轮换。",
+    "填了 Key 且未停用的引擎进入「调用顺序」：排在前面的优先调用，失败则 fallback 到下一个，拖 ⋮⋮ 可改顺序。每个引擎可填多个 Key（每行一个），同一引擎内也按顺序轮换。",
+  "engines.label": "搜索引擎",
+  "engines.summary": "启用 {on} · 停用 {off}",
+  "engines.summary.none": "尚未配置引擎",
+  "engines.hint":
+    "停用的引擎不再参与搜索，也不再参与 web_fetch 抓取（一个开关管两边）；Key 保留，重新启用即恢复。",
+  "engines.empty": "还没有填了 Key 的引擎。在下面的「调用顺序」里挑一个填入 Key，保存后它就会出现在这里。",
+  "engines.allOff": "所有已配置的引擎都已停用，网页搜索当前不可用。",
+  "row.disabled": "已停用 · 在「高级设置 → 搜索引擎」里启用",
   "fetch.label": "启用 web_fetch（URL 抓取）",
   "fetch.on":
     "已开启：模型可调用 web_fetch，抓取来源见「高级设置」里的「web_fetch 抓取来源」。",
@@ -449,6 +459,7 @@ const zh = {
   "stats.tally": "{ok}/{calls} 成功 · 平均 {avg} ms",
   "stats.unused": "未调用",
   "stats.benched": "冷却中 · 还剩 {min} 分钟",
+  "stats.disabled": "已停用",
   "stats.lastError": "最近错误：{error}",
   "stats.keyless": "无 Key",
   "stats.error": "读取统计失败：{error}",
@@ -544,7 +555,17 @@ const en: Record<keyof typeof zh, string> = {
   "legacy.copy": "Copy instruction",
   "legacy.copied": "Copied",
   intro:
-    "Engines with a key join the call order: the first one is tried first, and a failure falls back to the next. Drag ⋮⋮ to reorder. Each engine takes several keys (one per line), rotated in order too.",
+    "Engines with a key that are not switched off join the call order: the first one is tried first, and a failure falls back to the next. Drag ⋮⋮ to reorder. Each engine takes several keys (one per line), rotated in order too.",
+  "engines.label": "Search engines",
+  "engines.summary": "{on} on · {off} off",
+  "engines.summary.none": "No engine configured yet",
+  "engines.hint":
+    "A switched-off engine stops taking part in search and in web_fetch fetching alike — one switch, one meaning. Its keys are kept, and switching it back on restores it.",
+  "engines.empty":
+    "No engine has a key yet. Pick one under Call order below, add its key, and it appears here once saved.",
+  "engines.allOff":
+    "Every configured engine is switched off, so web search is currently unavailable.",
+  "row.disabled": "Switched off · enable it under Advanced → Search engines",
   "fetch.label": "Enable web_fetch (URL fetching)",
   "fetch.on":
     "On: the model can call web_fetch; where pages are fetched from is set by \"web_fetch source\" under Advanced.",
@@ -621,6 +642,7 @@ const en: Record<keyof typeof zh, string> = {
   "stats.tally": "{ok}/{calls} succeeded · avg {avg} ms",
   "stats.unused": "Not called",
   "stats.benched": "Benched · {min} min left",
+  "stats.disabled": "Switched off",
   "stats.lastError": "Last error: {error}",
   "stats.keyless": "keyless",
   "stats.error": "Could not load usage: {error}",
@@ -986,6 +1008,8 @@ type Snapshot = {
     volcengineApiKey?: string;
     enableFetch?: boolean;
     providerOrder?: string[];
+    /** Engine keys switched off; see the Host half's `disabledEngines`. */
+    disabledEngines?: string[];
     /** The {@link ADVANCED} fields, read through `storedAdvanced`. */
     [field: string]: unknown;
   };
@@ -1045,6 +1069,10 @@ function WebSearchFreeCard({
   >({});
   const [keyDrafts, setKeyDrafts] = React.useState<Record<string, string>>({});
   const [orderDraft, setOrderDraft] = React.useState<string[] | null>(null);
+  /** Engine keys switched off, `null` while following the stored value. */
+  const [disabledDraft, setDisabledDraft] = React.useState<string[] | null>(
+    null,
+  );
   const [enableFetchDraft, setEnableFetchDraft] = React.useState<
     boolean | null
   >(null);
@@ -1078,6 +1106,8 @@ function WebSearchFreeCard({
   // `null` = follow the default: collapsed once something is in the chain,
   // expanded while nothing is, so a fresh install still shows every engine.
   const [restOpen, setRestOpen] = React.useState<boolean | null>(null);
+  /** The Advanced group's engine switch list. Collapsed by default. */
+  const [enginesOpen, setEnginesOpen] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [clearing, setClearing] = React.useState(false);
   // Two-click arm for the destructive clear. Deliberately NOT `window.confirm`:
@@ -1174,6 +1204,23 @@ function WebSearchFreeCard({
     return Array.from(new Set([...known, ...DEFAULT_ORDER]));
   };
   const order = orderDraft ?? storedOrder();
+  // Same reasoning as `storedOrder`: the stored deny-list was written against
+  // the provider set of its day, so unknown names are dropped rather than
+  // carried into the save.
+  const storedDisabled = (): string[] => {
+    const raw = snapshot.value?.disabledEngines;
+    return Array.isArray(raw)
+      ? raw.filter((k) => PROVIDERS.some((p) => p.key === k))
+      : [];
+  };
+  const disabledKeys = disabledDraft ?? storedDisabled();
+  const isOff = (key: string) => disabledKeys.includes(key);
+  const toggleEngine = (key: string) =>
+    setDisabledDraft(
+      isOff(key)
+        ? disabledKeys.filter((entry) => entry !== key)
+        : [...disabledKeys, key],
+    );
   // enableFetch defaults to true (schema default); only an explicit false is "off".
   const storedEnableFetch = (): boolean =>
     snapshot.value?.enableFetch !== false;
@@ -1201,11 +1248,19 @@ function WebSearchFreeCard({
   const orderDirty =
     orderDraft !== null &&
     JSON.stringify(orderDraft) !== JSON.stringify(storedOrder());
+  // Compared as SETS: the stored array's order is incidental (the Host only
+  // ever asks "is this name in it"), so toggling an engine off and back on must
+  // not leave the Save button armed.
+  const disabledDirty =
+    disabledDraft !== null &&
+    JSON.stringify([...disabledDraft].sort()) !==
+      JSON.stringify([...storedDisabled()].sort());
   const enableFetchDirty =
     enableFetchDraft !== null && enableFetchDraft !== storedEnableFetch();
   const dirty =
     keyDirty.length > 0 ||
     orderDirty ||
+    disabledDirty ||
     enableFetchDirty ||
     advDirty.length > 0;
   const disabled = saving || clearing || snapshot.writable === false;
@@ -1236,6 +1291,12 @@ function WebSearchFreeCard({
     }
     if (orderDirty && orderDraft !== null)
       await scope.set("providerOrder", orderDraft);
+    if (disabledDirty && disabledDraft !== null) {
+      // A value equal to its default is unset, like the advanced fields, so the
+      // profile file only ever lists what the user actually changed.
+      if (disabledDraft.length === 0) await scope.unset("disabledEngines");
+      else await scope.set("disabledEngines", disabledDraft);
+    }
     if (enableFetchDirty && enableFetchDraft !== null)
       await scope.set("enableFetch", enableFetchDraft);
     // A value equal to its default is unset rather than written, so the
@@ -1261,6 +1322,9 @@ function WebSearchFreeCard({
     const orderLanded =
       JSON.stringify(after.value?.providerOrder ?? DEFAULT_ORDER) ===
       JSON.stringify(orderDraft ?? storedOrder());
+    const disabledLanded =
+      JSON.stringify([...(after.value?.disabledEngines ?? [])].sort()) ===
+      JSON.stringify([...(disabledDraft ?? storedDisabled())].sort());
     const enableFetchLanded =
       (after.value?.enableFetch !== false) ===
       (enableFetchDraft ?? storedEnableFetch());
@@ -1270,6 +1334,7 @@ function WebSearchFreeCard({
       ),
     );
     if (!orderLanded) setOrderDraft(null);
+    if (!disabledLanded) setDisabledDraft(null);
     if (!enableFetchLanded) setEnableFetchDraft(null);
     const rejectedAdv = advPending.filter(
       ({ spec, value }) =>
@@ -1284,6 +1349,7 @@ function WebSearchFreeCard({
     if (
       rejectedKeys.length > 0 ||
       !orderLanded ||
+      !disabledLanded ||
       !enableFetchLanded ||
       rejectedAdv.length > 0
     )
@@ -1310,6 +1376,7 @@ function WebSearchFreeCard({
     for (const field of [
       ...PROVIDERS.map((p) => p.field),
       "providerOrder",
+      "disabledEngines",
       "enableFetch",
       ...ADVANCED.map((spec) => spec.field),
     ]) {
@@ -1319,6 +1386,7 @@ function WebSearchFreeCard({
     // exists, and keeping them would re-show the cleared keys as unsaved.
     setKeyDrafts({});
     setOrderDraft(null);
+    setDisabledDraft(null);
     setEnableFetchDraft(null);
     setAdvDrafts({});
     const after = scope.getSnapshot();
@@ -1502,9 +1570,20 @@ function WebSearchFreeCard({
     // sub-line says where it lands on save.
     const isInChain = (provider: ProviderMeta) =>
       parseKeys(storedKey(provider.field)).length > 0;
+    // A switched-off engine keeps its key, so it stays in the chain group but
+    // takes no position in it: numbering it would claim a call slot it no
+    // longer holds. Which engines are off reads the DRAFT (a switch must react
+    // to the click that flipped it), while group membership reads the stored
+    // key, for the reason above.
     const chain = order.map(byKey).filter(isInChain);
     const rest = order.map(byKey).filter((p) => !isInChain(p));
     const showRest = restOpen ?? chain.length === 0;
+    const hasKeyStored = (provider: ProviderMeta) =>
+      parseKeys(storedKey(provider.field)).length > 0;
+    // Counts describe what the chain will actually call once saved: the list
+    // above the call order only ever contains engines with a stored key.
+    const enabledCount = chain.filter((p) => !isOff(p.key)).length;
+    const offCount = chain.filter((p) => isOff(p.key)).length;
 
     // `position` is the row's 1-based place in the fallback chain, or null for
     // an engine that has no key stored: only chain rows carry a number and are
@@ -1521,9 +1600,17 @@ function WebSearchFreeCard({
       const capsLabel = t(
         provider.caps.fetch ? "caps.searchFetch" : "caps.searchOnly",
       );
-      const sortable = position !== null && !disabled;
-      const status =
-        position !== null
+      // Derived from the draft, not from `position`: an off engine is passed
+      // `position === null`, so reading the switch off the position would make
+      // "off" and "no key stored" indistinguishable.
+      const off = hasKeyStored(provider) && isOff(key);
+      // An off engine keeps its drag handle: its place in the order still
+      // decides where it returns to when switched back on, and reordering it
+      // means dragging past the greyed row rather than enabling it first.
+      const sortable = (position !== null || off) && !disabled;
+      const status = off
+        ? t("row.disabled")
+        : position !== null
           ? keyCount > 0
             ? t("row.rotating", { count: keyCount })
             : t("row.cleared")
@@ -1581,7 +1668,7 @@ function WebSearchFreeCard({
             background: isDragging
               ? "var(--dsw-alias-bg-layer-2)"
               : "var(--dsw-alias-bg-layer-3)",
-            opacity: isDragging ? 0.5 : 1,
+            opacity: isDragging ? 0.5 : off ? 0.6 : 1,
           },
         },
         // Header line: handle · order badge · label/meta · caret
@@ -1605,7 +1692,7 @@ function WebSearchFreeCard({
                 "⋮⋮",
               )
             : null,
-          position !== null
+          position !== null && !off
             ? React.createElement(
                 "span",
                 {
@@ -1872,16 +1959,22 @@ function WebSearchFreeCard({
           "div",
           { style: groupLabelStyle },
           chain.length > 0
-            ? t("chain.labelCount", { count: chain.length })
+            ? t("chain.labelCount", { count: enabledCount })
             : t("chain.label"),
         ),
         chain.length > 0
           ? React.createElement(
               "div",
               { style: { display: "flex", flexDirection: "column", gap: 8 } },
-              ...chain.map((provider, index) =>
-                providerRow(provider, index + 1),
-              ),
+              // Positions count ENABLED engines only, so #1 is always the
+              // engine the chain really calls first — an off engine in between
+              // must not consume a number.
+              ...(() => {
+                let seen = 0;
+                return chain.map((provider) =>
+                  providerRow(provider, isOff(provider.key) ? null : ++seen),
+                );
+              })(),
             )
           : React.createElement(
               "div",
@@ -2194,6 +2287,126 @@ function WebSearchFreeCard({
                   t("preset.hint"),
                 ),
               ),
+              // Engine switches, directly under the presets and above every
+              // field they govern — the same seat the popover uses. Collapsed
+              // by default: a user with eight engines configured would
+              // otherwise scroll past eight switches every time they open
+              // Advanced. The header's count is the summary.
+              React.createElement(
+                "div",
+                {
+                  key: "engines",
+                  style: { display: "flex", flexDirection: "column", gap: 8 },
+                },
+                React.createElement(
+                  "button",
+                  {
+                    type: "button",
+                    onClick: () => setEnginesOpen(!enginesOpen),
+                    "aria-expanded": enginesOpen,
+                    style: {
+                      appearance: "none",
+                      border: 0,
+                      background: "none",
+                      padding: 0,
+                      font: "inherit",
+                      fontSize: 13,
+                      cursor: "pointer",
+                      textAlign: "left",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                    },
+                  },
+                  React.createElement(
+                    "span",
+                    {
+                      style: {
+                        color: "var(--dsw-alias-label-primary)",
+                        fontWeight: 500,
+                      },
+                    },
+                    t("engines.label"),
+                  ),
+                  React.createElement(
+                    "span",
+                    {
+                      style: {
+                        display: "inline-flex",
+                        color: "var(--dsw-alias-label-tertiary)",
+                        transition: "transform .16s",
+                        transform: enginesOpen ? "rotate(180deg)" : "none",
+                      },
+                    },
+                    caret(11),
+                  ),
+                  React.createElement(
+                    "span",
+                    {
+                      style: {
+                        marginLeft: "auto",
+                        fontSize: 11,
+                        color:
+                          enabledCount === 0 && offCount > 0
+                            ? "var(--dsw-alias-label-error)"
+                            : "var(--dsw-alias-label-tertiary)",
+                      },
+                    },
+                    enabledCount === 0 && offCount === 0
+                      ? t("engines.summary.none")
+                      : t("engines.summary", {
+                          on: enabledCount,
+                          off: offCount,
+                        }),
+                  ),
+                ),
+                enginesOpen
+                  ? React.createElement(
+                      "div",
+                      {
+                        style: {
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 8,
+                        },
+                      },
+                      engineToggles({
+                        // Configured engines only (the chain), in call order:
+                        // an engine with no key has nothing to switch off.
+                        engines: chain,
+                        off: isOff,
+                        onToggle: toggleEngine,
+                        disabled,
+                        t,
+                        fontSize: 13,
+                      }),
+                      React.createElement(
+                        "div",
+                        {
+                          style: {
+                            fontSize: 11,
+                            lineHeight: 1.6,
+                            color: "var(--dsw-alias-label-tertiary)",
+                          },
+                        },
+                        t("engines.hint"),
+                      ),
+                      enabledCount === 0 && offCount > 0
+                        ? React.createElement(
+                            "div",
+                            {
+                              style: {
+                                fontSize: 11,
+                                lineHeight: 1.6,
+                                color: "var(--dsw-alias-label-error)",
+                              },
+                            },
+                            t("engines.allOff"),
+                          )
+                        : null,
+                    )
+                  : null,
+              ),
               ...advancedRows.map(advancedRow),
             )
           : null,
@@ -2257,6 +2470,13 @@ function WebSearchFreeCard({
             },
             row.key ?? t("stats.keyless"),
           ),
+          row.disabled
+            ? React.createElement(
+                "span",
+                { style: { color: "var(--dsw-alias-label-tertiary)" } },
+                t("stats.disabled"),
+              )
+            : null,
           row.benchedForMs > 0
             ? React.createElement(
                 "span",
@@ -2816,6 +3036,98 @@ function toggleSwitch(on: boolean, disabled: boolean, onClick: () => void) {
   );
 }
 
+/**
+ * The engine on/off list, shared by the card and the popover so the two cannot
+ * drift: both render the SAME engines in the SAME order with the SAME labels.
+ *
+ * It is a separate element from the call-order rows on purpose. Those rows own
+ * the key and read their state from saved values, whereas this is the one place
+ * a switch must answer the click instantly — so `off`/`onToggle` come from the
+ * caller's draft, and the caller keeps the engine list itself derived from
+ * configured engines.
+ */
+function engineToggles({
+  engines,
+  off,
+  onToggle,
+  disabled,
+  t,
+  fontSize,
+}: {
+  engines: readonly ProviderMeta[];
+  off: (key: string) => boolean;
+  onToggle: (key: string) => void;
+  disabled: boolean;
+  t: Translate;
+  fontSize: number;
+}) {
+  if (engines.length === 0)
+    return React.createElement(
+      "div",
+      {
+        style: {
+          fontSize: 12,
+          lineHeight: 1.6,
+          color: "var(--dsw-alias-label-tertiary)",
+        },
+      },
+      t("engines.empty"),
+    );
+  return React.createElement(
+    "div",
+    { style: { display: "flex", flexDirection: "column", gap: 2 } },
+    ...engines.map((provider) => {
+      const on = !off(provider.key);
+      return React.createElement(
+        "div",
+        {
+          key: provider.key,
+          style: {
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "5px 0",
+            fontSize,
+          },
+        },
+        React.createElement(
+          "span",
+          {
+            style: {
+              flex: 1,
+              minWidth: 0,
+              color: on
+                ? "var(--dsw-alias-label-primary)"
+                : "var(--dsw-alias-label-tertiary)",
+              fontWeight: 500,
+            },
+          },
+          provider.label,
+        ),
+        // The chips the call-order rows show, so an engine's capabilities are
+        // readable from here too — this list is often the only thing opened.
+        React.createElement(
+          "span",
+          {
+            style: {
+              flex: "none",
+              whiteSpace: "nowrap",
+              borderRadius: 4,
+              padding: "0 5px",
+              fontSize: 10,
+              lineHeight: "15px",
+              color: "var(--dsw-alias-label-tertiary)",
+              background: "var(--dsw-alias-bg-layer-2)",
+            },
+          },
+          t(provider.caps.fetch ? "caps.searchFetch" : "caps.searchOnly"),
+        ),
+        toggleSwitch(on, disabled, () => onToggle(provider.key)),
+      );
+    }),
+  );
+}
+
 /** The single chevron used by every expander in this card. */
 function caret(size: number) {
   return React.createElement(
@@ -3074,6 +3386,8 @@ function WebSearchShortcutPanel({
   const t = React.useMemo(() => translate(lang), [lang]);
 
   const [drafts, setDrafts] = React.useState<Record<string, unknown>>({});
+  /** The engine switch list. Collapsed by default, like the card's. */
+  const [enginesOpen, setEnginesOpen] = React.useState(false);
   const [domainsOpen, setDomainsOpen] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [failed, setFailed] = React.useState("");
@@ -3128,12 +3442,59 @@ function WebSearchShortcutPanel({
   const value = (spec: AdvancedField): unknown =>
     spec.field in drafts ? drafts[spec.field] : storedField(snapshot, spec);
 
+  // The engine switch list is not an `AdvancedField` (its value is an array of
+  // engine names, not a scalar), so it keeps its own draft slot under this key
+  // and rides the same Save. Absent = follow the stored deny-list.
+  const ENGINE_DRAFT = "disabledEngines";
+  const storedOff = (): string[] =>
+    Array.isArray(snapshot.value?.disabledEngines)
+      ? (snapshot.value!.disabledEngines as string[]).filter((k) =>
+          PROVIDERS.some((p) => p.key === k),
+        )
+      : [];
+  const offKeys: string[] = Array.isArray(drafts[ENGINE_DRAFT])
+    ? (drafts[ENGINE_DRAFT] as string[])
+    : storedOff();
+  const isOff = (key: string) => offKeys.includes(key);
+  const toggleEngine = (key: string) =>
+    setDrafts({
+      ...drafts,
+      [ENGINE_DRAFT]: isOff(key)
+        ? offKeys.filter((entry) => entry !== key)
+        : [...offKeys, key],
+    });
+  // Only engines that are configured (one with no key has nothing to switch),
+  // in the card's order — the stored order unioned with the current defaults,
+  // exactly as `storedOrder` in the card does, so the two lists read alike.
+  const switchable = Array.from(
+    new Set([
+      ...(Array.isArray(snapshot.value?.providerOrder)
+        ? (snapshot.value!.providerOrder as string[])
+        : []),
+      ...DEFAULT_ORDER,
+    ]),
+  )
+    .map(byKey)
+    .filter((provider): provider is ProviderMeta => provider !== undefined)
+    .filter((provider) => {
+      const raw =
+        snapshot.value?.[provider.field as keyof NonNullable<Snapshot["value"]>];
+      return typeof raw === "string" && raw.trim() !== "";
+    });
+
   const dirtySpecs = ADVANCED.filter(
     (spec) =>
       spec.field in drafts &&
       JSON.stringify(coerceAdvanced(spec, drafts[spec.field])) !==
         JSON.stringify(storedField(snapshot, spec)),
   );
+  // Compared as sets, matching the card: the stored order is incidental.
+  const enginesDirty =
+    ENGINE_DRAFT in drafts &&
+    JSON.stringify([...offKeys].sort()) !==
+      JSON.stringify([...storedOff()].sort());
+  /** Anything to write at all; the Save button's own enable state. */
+  const hasEdits = dirtySpecs.length > 0 || enginesDirty;
   const disabled = saving || snapshot.writable === false;
 
   const save = async () => {
@@ -3145,6 +3506,11 @@ function WebSearchShortcutPanel({
         await scope.unset(spec.field);
       else await scope.set(spec.field, next);
     }
+    if (enginesDirty) {
+      // Default (nothing switched off) is unset, not written, like the rest.
+      if (offKeys.length === 0) await scope.unset(ENGINE_DRAFT);
+      else await scope.set(ENGINE_DRAFT, offKeys);
+    }
     // Writes swallow wire failures and reload instead of throwing, so the
     // Host's readback is the only authority on what landed.
     const after = scope.getSnapshot();
@@ -3155,8 +3521,11 @@ function WebSearchShortcutPanel({
             spec.def,
         ) !== JSON.stringify(coerceAdvanced(spec, drafts[spec.field])),
     );
+    const enginesLanded =
+      JSON.stringify([...(after.value?.disabledEngines ?? [])].sort()) ===
+      JSON.stringify([...offKeys].sort());
     setSaving(false);
-    if (stillDirty) setFailed(t("error.save"));
+    if (stillDirty || !enginesLanded) setFailed(t("error.save"));
     else {
       setDrafts({});
       shortcutOpen.setOpen(false);
@@ -3428,6 +3797,110 @@ function WebSearchShortcutPanel({
           ),
         ),
       ),
+      // Engine switches, above the fields they govern — the same seat the card
+      // puts them in, so the two surfaces cannot be read differently. Collapsed
+      // by default, like the card's: with eight engines configured, an always-
+      // open list would push every field below it out of the popover.
+      //
+      // Type follows the field rows below (12px / 500 / primary), NOT the
+      // 11px group captions: this is a control header in the same stack as
+      // "搜索策略", and at 11px it reads as a section label from another list.
+      React.createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 6 } },
+        React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => setEnginesOpen(!enginesOpen),
+            "aria-expanded": enginesOpen,
+            title: t("engines.hint"),
+            style: {
+              appearance: "none",
+              border: 0,
+              background: "none",
+              padding: 0,
+              font: "inherit",
+              fontSize: 12,
+              lineHeight: 1.35,
+              cursor: "pointer",
+              textAlign: "left",
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+            },
+          },
+          React.createElement(
+            "span",
+            {
+              style: {
+                color: "var(--dsw-alias-label-primary)",
+                fontWeight: 500,
+              },
+            },
+            t("engines.label"),
+          ),
+          React.createElement(
+            "span",
+            {
+              style: {
+                display: "inline-flex",
+                color: "var(--dsw-alias-label-tertiary)",
+                transition: "transform .16s",
+                transform: enginesOpen ? "rotate(180deg)" : "none",
+              },
+            },
+            caret(10),
+          ),
+          React.createElement(
+            "span",
+            {
+              style: {
+                marginLeft: "auto",
+                fontSize: 11,
+                color:
+                  switchable.length > 0 &&
+                  switchable.every((p) => isOff(p.key))
+                    ? "var(--dsw-alias-label-error)"
+                    : "var(--dsw-alias-label-tertiary)",
+              },
+            },
+            switchable.length === 0
+              ? t("engines.summary.none")
+              : t("engines.summary", {
+                  on: switchable.filter((p) => !isOff(p.key)).length,
+                  off: switchable.filter((p) => isOff(p.key)).length,
+                }),
+          ),
+        ),
+        enginesOpen
+          ? React.createElement(
+              "div",
+              { style: { display: "flex", flexDirection: "column", gap: 6 } },
+              engineToggles({
+                engines: switchable,
+                off: isOff,
+                onToggle: toggleEngine,
+                disabled,
+                t,
+                fontSize: 12,
+              }),
+              switchable.length > 0 && switchable.every((p) => isOff(p.key))
+                ? React.createElement(
+                    "div",
+                    {
+                      style: {
+                        fontSize: 11,
+                        lineHeight: 1.5,
+                        color: "var(--dsw-alias-label-error)",
+                      },
+                    },
+                    t("engines.allOff"),
+                  )
+                : null,
+            )
+          : null,
+      ),
       ...SHORTCUT_FIELDS.map((name) => specOf(name))
         .filter((spec): spec is AdvancedField => spec !== undefined)
         .filter(
@@ -3536,13 +4009,13 @@ function WebSearchShortcutPanel({
         "button",
         {
           type: "button",
-          disabled: disabled || dirtySpecs.length === 0,
+          disabled: disabled || !hasEdits,
           onClick: save,
           style: {
             ...btnPrimaryStyle,
             fontSize: 12,
             padding: "4px 12px",
-            ...(disabled || dirtySpecs.length === 0
+            ...(disabled || !hasEdits
               ? { opacity: 0.4, cursor: "default" }
               : {}),
           },
